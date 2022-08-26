@@ -1,5 +1,7 @@
 import argparse
+import logging
 import os
+import time
 from datetime import datetime
 
 import torch
@@ -9,8 +11,12 @@ from torch import nn, optim
 from torch.utils import data
 from torchvision import datasets, transforms
 from tqdm import tqdm
-import collections.abc
 from LeNet import LeNet5
+
+
+def logstr(str: str):
+    logging.info(str)
+    print(str)
 
 
 def valid(epoch, net, valid_data_loader, loss_fun, writer, device):
@@ -38,17 +44,17 @@ def valid(epoch, net, valid_data_loader, loss_fun, writer, device):
             test_correct_sum += (max_idx_list == labels).sum()
             # 计算损失
             test_loss_sum = loss_fun(y, labels) + test_loss_sum
-
-    accuracy = test_correct_sum / (
-            len(valid_data_loader) * valid_data_loader.batch_size)  # len(valid_data_loader) 为batch的数目
+    # len(valid_data_loader)为batch的数目，valid_data_loader.batch_size为batch的大小
+    accuracy = test_correct_sum / (len(valid_data_loader) * valid_data_loader.batch_size)
     test_loss_mean = test_loss_sum / len(valid_data_loader)  # 因为损失函数自动对每一个minibitch求平均，所以loss的和为每一个minibitch的数量
-    print("acc: {} , loss: {}".format(accuracy.item(), test_loss_mean.item()))
-    writer.add_scalar("test/acc", scalar_value=accuracy, global_step=epoch)
-    writer.add_scalar("test/loss", scalar_value=test_loss_mean, global_step=epoch)
+    writer.add_scalar("test/loss", scalar_value=test_loss_mean.item(), global_step=epoch)
+    writer.add_scalar("test/acc", scalar_value=accuracy.item(), global_step=epoch)
+    logstr("test/loss:\t{}".format(test_loss_mean.item()))
+    logstr("test/acc:\t{}".format(accuracy.item()))
 
 
 def train(start_epoch, epochs, train_data_loader, valid_data_loader, model, optimizer, loss_fun, scheduler, writer,
-          state_dict_root, device):
+          save_state_path, device):
     """
     :param start_epoch: 训练开始是那个epoch，主要服务于 ”中断后继续训练“
     :param epochs:  总epoch数目
@@ -64,10 +70,12 @@ def train(start_epoch, epochs, train_data_loader, valid_data_loader, model, opti
     :return:
     """
 
+    logstr("训练开始")
+    start = time.perf_counter()
+
     # 开始epoch循环
     for epoch in range(start_epoch, epochs):
         # 训练开始标志，能够开启batch-normalization和dropout
-        batch_num_train = 0  # 一个epoch中batch 的数目
         train_loss_sum = 0
         for data in tqdm(train_data_loader, desc="epoch:{}-train: ".format(epoch), colour="GREEN"):
             # 获得数据
@@ -85,10 +93,14 @@ def train(start_epoch, epochs, train_data_loader, valid_data_loader, model, opti
             # 优化器更新模型的权重
             optimizer.step()
             train_loss_sum += loss
-            batch_num_train += 1
-        tain_loss_mean = train_loss_sum / batch_num_train
-        writer.add_scalar("train/loss", scalar_value=tain_loss_mean, global_step=epoch)  # 记录每一百个bitch（640个）后的loss
+
+        train_loss_mean = train_loss_sum / len(train_data_loader)  # len(train_data_loader)为batch 的数量
         writer.add_scalar("learning_rate", scalar_value=scheduler.get_last_lr()[0], global_step=epoch)
+        writer.add_scalar("train/loss", scalar_value=train_loss_mean.item(),
+                          global_step=epoch)  # 记录每一百个bitch（640个）后的loss
+        logstr("epoch: {}".format(epoch))
+        logstr("learning_rate:\t{}".format(scheduler.get_last_lr()[0]))
+        logstr("train/loss:\t{}".format(train_loss_mean.item()))
 
         # 更新学习率
         scheduler.step()
@@ -106,8 +118,11 @@ def train(start_epoch, epochs, train_data_loader, valid_data_loader, model, opti
             "Optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
         }
-        torch.save(state, state_dict_root + "/LenetMnist{0}.pt".format(epoch))
-        # print("模型已保存")
+        torch.save(state, save_state_path + "/LenetMnist{0}.pt".format(epoch))
+        logstr("模型已保存 -> " + save_state_path + "/LenetMnist{0}.pt".format(epoch))
+        logstr("---------------------------------")
+    end = time.perf_counter()
+    logstr("训练结束，训练耗时：{}".format(end - start))
 
 
 def main(args):
@@ -161,21 +176,38 @@ def main(args):
     # 创建tensorboard来记录网络
     time_str = str(datetime.now().strftime('%Y-%m-%d_%H-%M-%S'))
     log_path = os.path.join(args.log_root, time_str)  # "./log/" + time_str
-    writer = tensorboard.SummaryWriter(log_path)
+    save_state_path = os.path.join(log_path, "state")
+    tensorboard_dir = os.path.join(log_path, "tensorboard")
+    logging_dir = os.path.join(log_path, "logs")
+
+    if not os.path.exists(save_state_path):
+        os.makedirs(save_state_path)
+    if not os.path.exists(tensorboard_dir):
+        os.makedirs(tensorboard_dir)
+    if not os.path.exists(logging_dir):
+        os.makedirs(logging_dir)
+
+    writer = tensorboard.SummaryWriter(log_dir=tensorboard_dir)
+    logging.basicConfig(filename=os.path.join(logging_dir, "train_log.txt"), format='%(asctime)s : %(message)s',
+                        level=logging.INFO)
+
+    logstr("batch_size: {}, num_workers: {} ,".format(args.batch_size, args.num_workers) +
+           "epochs: {}, GPU_list: {}, ".format(args.epochs, args.GPU_list) +
+           "learning_rate: {}, log_root: {}, ".format(args.learning_rate, args.log_root) +
+           "resume_path: {}".format(args.resume_path))
 
     # 8.开始训练
     train(start_epoch, args.epochs, train_data_loader, valid_data_loader, model, sgd_optimizer, loss_fun, scheduler,
-          writer,
-          log_path, device)
+          writer, save_state_path, device)
     writer.close()
 
 
 def parse_args():
     parser = argparse.ArgumentParser('Model')
 
-    parser.add_argument('--batch_size', type=int, default=24 * 4, help='batch的大小')
+    parser.add_argument('--batch_size', type=int, default=32 * 4, help='batch的大小')
     parser.add_argument('--num_workers', type=int, default=3, help='dataloader 的num_works的大小')
-    parser.add_argument('--epochs', default=100, type=int, help='总epoch的数量')
+    parser.add_argument('--epochs', default=200, type=int, help='总epoch的数量')
     parser.add_argument('--GPU_list', type=str, default="0,1,2,3", help='可用gpu编号')
     parser.add_argument('--learning_rate', type=float, default=0.01, help='初始学习率')
     parser.add_argument('--log_root', type=str, default='./log/data_parallel', help='保存权重和tensorboard的root')

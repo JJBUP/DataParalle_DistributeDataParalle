@@ -120,4 +120,3 @@ lenetMnist*.pt
 # dataset
 datasets/
 # log
-log/

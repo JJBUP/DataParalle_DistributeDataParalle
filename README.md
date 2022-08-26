@@ -11,7 +11,7 @@
 | [DataParallel()](https://pytorch.org/docs/stable/generated/torch.nn.DataParallel.html#torch.nn.DataParallel) | 该函数实现了在module级别上的数据并行使用，注意batch size要大于GPU的数量。 |
 |                                                              | module, device_ids=None, output_device=None, dim=0           |
 |                                                              | **module：**需要多GPU训练的网络模型<br/>**device_ids：list[ int or torch.device]**，GPU的编号（默认全部GPU），手动设定<br/>**output_device： int or torch.device**，GPU的主设备编号，默认是第0块GPU（默认是device_ids[0]) |
-|                                                              | 例如：**output_device=gpus[0] **指定的第 0 张卡为主卡，相当于参数服务器，其向其他卡广播其参数，参与训练的 GPU 参数**device_ids=gpus**；<br/>output_device一般不使用，默认为GPU0即可，原因是代码将使用更少的判断兼容单GPU的训练！ |
+|                                                              | 例如：`output_device=gpus[0] `模型在device_ids中用于复制模型和复制梯度的主卡，相当于参数服务器，其向其他卡广播其参数，参与训练的 GPU 参数`device_ids=gpus`；<br/>`output_device`一般默认为逻辑cuda0，**要保证模型输出device的pred张量和target等在同一个device上，否则会报错** |
 
 **（1）DP数据并行处理机制：**
 
@@ -269,4 +269,25 @@ if rank == 0:
 虽然准备工作做的非常充分，但是还是遇到了bug
 
 1.  init_process_group()  认为TCP://127.0.0.1:12345 是单机多卡，这导致程序再init process group时阻塞等待其他进程的加入
-2. 其他卡被其他程序用着，只要显存够我们就能使用
+2.  其他卡被其他程序用着，只要显存够我们就能使用
+
+# 实验
+
+[Mnist demo](https://github.com/JJBUP/DataParalle_DistributeDataParalle_Demo)
+
+该实验实现Mnist数据集上的DP和DDP的使用
+
+我们batch_size =  24 × 3 ，
+
+红色表示DP的曲线，绿色表示DDP且syncBN=Flase ，橘色表示表示DDP且syncBN=True
+
+- 准确率上，使用DP的方式准确度更高，大约是0.008
+- loss上，使用DDP方式的loss更低，其中syncBN为True的loss要低于False
+- 速度上，
+  - DP耗时1621.73秒，速度最慢
+  - DDP且syncBN=Flase耗时696.08秒，速度最快
+  - DDP且syncBN=True耗时805.13，速度适中
+
+
+
+<img src="README.assets/image-20220826191037116.png" alt="image-20220826191037116" style="zoom:80%;" />

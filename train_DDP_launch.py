@@ -1,5 +1,7 @@
 import argparse
+import logging
 import os
+import time
 from datetime import datetime
 
 import torch
@@ -9,8 +11,12 @@ from torch.utils import data
 from torchvision import datasets, transforms
 from tqdm import tqdm
 import torch.distributed as dist
-
 from LeNet import LeNet5
+
+
+def logstr(str: str):
+    logging.info(str)
+    print(str)
 
 
 def valid(epoch, args, net, valid_data_loader, loss_fun, writer, device):
@@ -52,13 +58,14 @@ def valid(epoch, args, net, valid_data_loader, loss_fun, writer, device):
         # len(valid_data_loader)为batch的数目，valid_data_loader.batch_size为batch的大小
         accuracy = test_correct_sum / (len(valid_data_loader) * valid_data_loader.batch_size * args.world_size)
         test_loss_mean = test_loss_sum / (len(valid_data_loader) * args.world_size)  # 求每个mini-batch的平均loss
-        print("acc: {} , loss: {}".format(accuracy.item(), test_loss_mean.item()))
-        writer.add_scalar("test/acc", scalar_value=accuracy, global_step=epoch)
-        writer.add_scalar("test/loss", scalar_value=test_loss_mean, global_step=epoch)
+        writer.add_scalar("test/loss", scalar_value=test_loss_mean.item(), global_step=epoch)
+        writer.add_scalar("test/acc", scalar_value=accuracy.item(), global_step=epoch)
+        logstr("test/loss:\t{}".format(test_loss_mean.item()))
+        logstr("test/acc:\t{}".format(accuracy.item()))
 
 
 def train(start_epoch, args, train_data_loader, valid_data_loader, train_sampler, model, optimizer, loss_fun, scheduler,
-          writer, state_dict_root, device):
+          writer, save_state_path, device):
     """
     :param start_epoch: 训练开始是那个epoch，主要服务于 ”中断后继续训练“
     :param epochs:  总epoch数目
@@ -73,6 +80,9 @@ def train(start_epoch, args, train_data_loader, valid_data_loader, train_sampler
     :param device: 训练设备
     :return:
     """
+
+    logstr("训练开始")
+    start = time.perf_counter()
 
     # 开始epoch循环
     for epoch in range(start_epoch, args.epochs):
@@ -100,15 +110,19 @@ def train(start_epoch, args, train_data_loader, valid_data_loader, train_sampler
             # TODO:all reduce 计算所有进程loss、acc（all reduce方法是同步的方式计算所有进程，无需rank==0，且是inplace=true的）
             dist.all_reduce(loss)  # 求所有进程一轮mini-batch的loss和
             train_loss_sum += loss
-        # TODO:rank == 0记录信息
-        if args.rank == 0:
-            train_loss_mean = train_loss_sum / (
-                    len(train_data_loader) * args.world_size)  # len(train_data_loader)为batch 的数量
-            writer.add_scalar("train/loss", scalar_value=train_loss_mean, global_step=epoch)  # 记录每一百个bitch（640个）后的loss
-            writer.add_scalar("learning_rate", scalar_value=scheduler.get_last_lr()[0], global_step=epoch)
 
         # 更新学习率
         scheduler.step()
+        # TODO:rank == 0记录信息
+        if args.rank == 0:
+            # len(train_data_loader)为batch 的数量
+            train_loss_mean = train_loss_sum / (len(train_data_loader) * args.world_size)
+            writer.add_scalar("learning_rate", scalar_value=scheduler.get_last_lr()[0], global_step=epoch)
+            writer.add_scalar("train/loss", scalar_value=train_loss_mean.item(),
+                              global_step=epoch)  # 记录每一百个bitch（640个）后的loss
+            logstr("epoch: {}".format(epoch))
+            logstr("learning_rate:\t{}".format(scheduler.get_last_lr()[0]))
+            logstr("train/loss:\t{}".format(train_loss_mean.item()))
 
         # 测试
         valid(epoch, args, model, valid_data_loader, loss_fun, writer, device)
@@ -124,8 +138,13 @@ def train(start_epoch, args, train_data_loader, valid_data_loader, train_sampler
                 "Optimizer_state_dict": optimizer.state_dict(),
                 "scheduler_state_dict": scheduler.state_dict(),
             }
-            torch.save(state, state_dict_root + "/LenetMnist{0}.pt".format(epoch))
-        # print("模型已保存")
+            torch.save(state, save_state_path + "/LenetMnist{0}.pt".format(epoch))
+            logstr("模型已保存 -> " + save_state_path + "/LenetMnist{0}.pt".format(epoch))
+            logstr("---------------------------------")
+    # TODO:rank == 0记录信息
+    if args.rank == 0:
+        end = time.perf_counter()
+        logstr("训练结束，训练耗时：{}".format(end - start))
 
 
 # TODO: 初始化进程组
@@ -215,20 +234,45 @@ def main(args):
 
     # 7.log 设置
     # 创建tensorboard来记录网络
-    time_str = str(datetime.now().strftime('%Y-%m-%d_%H-%M-%S'))
-    log_path = os.path.join(args.log_root, time_str)  # "./log/" + time_str
-    writer = tensorboard.SummaryWriter(log_path)
+    writer = None
+    save_state_path = None
+    # TODO:rank == 0记录信息
+    if args.rank == 0:
+        time_str = str(datetime.now().strftime('%Y-%m-%d_%H-%M-%S'))
+        log_path = os.path.join(args.log_root, time_str)  # "./log/" + time_str
+        save_state_path = os.path.join(log_path, "state")
+        tensorboard_dir = os.path.join(log_path, "tensorboard")
+        logging_dir = os.path.join(log_path, "logs")
+
+        if not os.path.exists(save_state_path):
+            os.makedirs(save_state_path)
+        if not os.path.exists(tensorboard_dir):
+            os.makedirs(tensorboard_dir)
+        if not os.path.exists(logging_dir):
+            os.makedirs(logging_dir)
+
+        writer = tensorboard.SummaryWriter(log_dir=tensorboard_dir)
+        logging.basicConfig(filename=os.path.join(logging_dir, "train_log.txt"), format='%(asctime)s : %(message)s',
+                            level=logging.INFO)
+        logstr("batch_size: {}, num_workers: {} ,".format(args.batch_size, args.num_workers) +
+               "pin_memory: {}, epochs: {}, ".format(args.pin_memory, args.epochs) +
+               "learning_rate: {}, log_root: {}, ".format(args.learning_rate, args.log_root) +
+               "resume_path: {}, init_method: {}, ".format(args.resume_path, args.init_method) +
+               "init_method: {}, dist_backend: {}, ".format(args.init_method, args.dist_backend) +
+               "syncBN: {}".format(args.syncBN))
 
     # 8.开始训练
     train(start_epoch, args, train_data_loader, valid_data_loader, train_sampler, model, sgd_optimizer, loss_fun,
-          scheduler, writer, log_path, device)
-    writer.close()
+          scheduler, writer, save_state_path, device)
+    # TODO:rank == 0记录信息
+    if args.rank == 0:
+        writer.close()
 
 
 def parse_add_args():
     parser = argparse.ArgumentParser('Model')
 
-    parser.add_argument('--batch_size', type=int, default=24, help='batch的大小，DDP真实的batch_size应该为16 * world_size（进程数）')
+    parser.add_argument('--batch_size', type=int, default=32, help='batch的大小，DDP真实的batch_size应该为16 * world_size（进程数）')
     parser.add_argument('--num_workers', type=int, default=8, help='dataloader 的num_works的大小')
     parser.add_argument('--pin_memory', type=bool, default=True, help='dataloader是否使用锁页内存加载数据')
     parser.add_argument('--epochs', default=200, type=int, help='总epoch的数量')
@@ -237,7 +281,7 @@ def parse_add_args():
     parser.add_argument('--resume_path', type=str, default='', help='继续训练的地址，若为 none则重新训练')
     parser.add_argument('--init_method', type=str, default="env://", help='进程组环境变量初始化 或 TCP初始化-主机的IP+端口号')
     parser.add_argument('--dist_backend', type=str, default='nccl', help='分布式主机间通信协议')
-    parser.add_argument('--syncBN', type=bool, default=False, help='是否使用同步的BN')
+    parser.add_argument('--syncBN', type=bool, default=True, help='是否使用同步的BN')
     # DDP的gpu从torch.launch中设定，为local_rank参数
     return parser.parse_args()
 
